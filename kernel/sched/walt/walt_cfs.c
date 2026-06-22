@@ -183,6 +183,13 @@ static void walt_get_indicies(struct task_struct *p, int *order_index,
 		return;
 	}
 
+#if IS_ENABLED(CONFIG_PERF_RESERVE)
+	if (is_task_prio_need_low_cpu(p))
+		return;
+	if (is_task_high_cpu_prio(p))
+		*end_index = num_sched_clusters;
+#endif
+
 	if (is_uclamp_boosted || per_task_boost ||
 		task_boost_policy(p) == SCHED_BOOST_ON_BIG ||
 		walt_task_skip_min_cpu(p)) {
@@ -253,9 +260,9 @@ static void walt_find_best_target(struct sched_domain *sd,
 	bool rtg_high_prio_task = task_rtg_high_prio(p);
 	cpumask_t visit_cpus;
 	struct walt_task_struct *wts = (struct walt_task_struct *) p->android_vendor_data1;
-	unsigned int visited_cluster = 0;
 	unsigned int search_sibling_cluster = 0;
 	int cpu;
+	bool visited_clusters[MAX_CLUSTERS] = {[0 ... (MAX_CLUSTERS-1)] = false};
 
 	/* Find start CPU based on boost value */
 	start_cpu = fbt_env->start_cpu;
@@ -274,6 +281,13 @@ static void walt_find_best_target(struct sched_domain *sd,
 		most_spare_wake_cap = LONG_MIN;
 	}
 
+#if IS_ENABLED(CONFIG_PERF_RESERVE)
+	if (is_task_prio_need_low_cpu(p)) {
+		stop_index = 0;
+		most_spare_wake_cap = LONG_MIN;
+	}
+#endif
+
 	/* fast path for prev_cpu */
 	if (((capacity_orig_of(prev_cpu) == capacity_orig_of(start_cpu)) ||
 				asym_cap_siblings(prev_cpu, start_cpu)) &&
@@ -282,7 +296,7 @@ static void walt_find_best_target(struct sched_domain *sd,
 				cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
 		fbt_env->fastpath = PREV_CPU_FASTPATH;
 		cpumask_set_cpu(prev_cpu, candidates);
-		visited_cluster = BIT(cpu_cluster(prev_cpu)->id);
+		visited_clusters[cpu_cluster(prev_cpu)->id] = true;
 		goto out;
 	}
 
@@ -293,9 +307,8 @@ retry:
 		int target_cpu_cluster = -1;
 		int this_complex_idle = 0;
 		int best_complex_idle = 0;
+		int cluster_id;
 
-		if (BIT(sched_cluster[cluster]->id) & visited_cluster)
-			continue;
 		target_max_spare_cap = 0;
 		min_exit_latency = INT_MAX;
 		best_idle_cuml_util = ULONG_MAX;
@@ -303,13 +316,18 @@ retry:
 		if (search_sibling_cluster) {
 			if (!(search_sibling_cluster & BIT(cluster)))
 				continue;
-			visited_cluster |= BIT(cluster);
+			cluster_id = cluster;
 			cpumask_and(&visit_cpus, p->cpus_ptr, &sched_cluster[cluster]->cpus);
 		} else {
 			cpumask_and(&visit_cpus, p->cpus_ptr, &cpu_array[order_index][cluster]);
-			visited_cluster |= BIT(cpu_cluster(
-					cpumask_first(&cpu_array[order_index][cluster]))->id);
+			cluster_id = cpu_cluster(
+					cpumask_first(&cpu_array[order_index][cluster]))->id;
 		}
+
+		if (visited_clusters[cluster_id])
+			continue;
+
+		visited_clusters[cluster_id] = true;
 
 		for_each_cpu(i, &visit_cpus) {
 			unsigned long capacity_orig = capacity_orig_of(i);
@@ -336,9 +354,6 @@ retry:
 				continue;
 
 			if (fbt_env->skip_cpu == i)
-				continue;
-
-			if (wrq->num_mvp_tasks > 0)
 				continue;
 
 			/*
@@ -494,10 +509,10 @@ out:
 	search_sibling_cluster = 0;
 	for_each_cpu(cpu, candidates) {
 		struct walt_sched_cluster *cluster = cpu_cluster(cpu);
+		int sibling = cluster->sibling_cluster;
 
-		if ((cluster->sibling_cluster >= 0) &&
-		    !(BIT(cluster->sibling_cluster) & visited_cluster)) {
-			search_sibling_cluster |= BIT(cluster->sibling_cluster);
+		if ((sibling >= 0) && !visited_clusters[sibling]) {
+			search_sibling_cluster |= BIT(sibling);
 		}
 	}
 	if (search_sibling_cluster) {
@@ -992,21 +1007,21 @@ static void walt_binder_low_latency_set(void *unused, struct task_struct *task,
 	if (unlikely(walt_disabled))
 		return;
 
-	if (task && current->signal &&
-			(current->signal->oom_score_adj == 0) &&
-			((current->prio < DEFAULT_PRIO) ||
-			(task->group_leader->prio < MAX_RT_PRIO)))
+	if (task && ((task_in_related_thread_group(current) &&
+			task->group_leader->prio < MAX_RT_PRIO) ||
+			(current->group_leader->prio < MAX_RT_PRIO &&
+			task_in_related_thread_group(task))))
 		wts->low_latency |= WALT_LOW_LATENCY_BINDER;
-}
-
-static void walt_binder_low_latency_clear(void *unused, struct binder_transaction *t)
-{
-	struct walt_task_struct *wts = (struct walt_task_struct *) current->android_vendor_data1;
-
-	if (unlikely(walt_disabled))
-		return;
-
-	if (wts->low_latency & WALT_LOW_LATENCY_BINDER)
+	else
+		/*
+		 * Clear low_latency flag if criterion above is not met, this
+		 * will handle usecase where for a binder thread WALT_LOW_LATENCY_BINDER
+		 * is set by one task and before WALT clears this flag after timer expiry
+		 * some other task tries to use same binder thread.
+		 *
+		 * The only gets cleared when binder transaction is initiated
+		 * and the above condition to set flasg is nto satisfied.
+		 */
 		wts->low_latency &= ~WALT_LOW_LATENCY_BINDER;
 }
 
@@ -1068,6 +1083,10 @@ static inline unsigned int walt_cfs_mvp_task_limit(struct task_struct *p)
 	/* Binder MVP tasks are high prio but have only single slice */
 	if (wts->mvp_prio == WALT_BINDER_MVP)
 		return WALT_MVP_SLICE;
+
+	if (walt_procfs_low_latency_task(p) ||
+			walt_pipeline_low_latency_task(p))
+		return WALT_MVP_LL_SLICE;
 
 	return WALT_MVP_LIMIT;
 }
@@ -1348,7 +1367,6 @@ void walt_cfs_init(void)
 	register_trace_android_rvh_select_task_rq_fair(walt_select_task_rq_fair, NULL);
 
 	register_trace_android_vh_binder_wakeup_ilocked(walt_binder_low_latency_set, NULL);
-	register_trace_binder_transaction_received(walt_binder_low_latency_clear, NULL);
 
 	register_trace_android_vh_binder_set_priority(binder_set_priority_hook, NULL);
 	register_trace_android_vh_binder_restore_priority(binder_restore_priority_hook, NULL);

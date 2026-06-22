@@ -75,7 +75,12 @@
 
 #include "binder_internal.h"
 #include "binder_trace.h"
+
+int system_server_pid = 0;
+
 #include <trace/hooks/binder.h>
+
+int system_server_pid;
 
 static HLIST_HEAD(binder_deferred_list);
 static DEFINE_MUTEX(binder_deferred_lock);
@@ -1283,6 +1288,10 @@ static void binder_cleanup_ref_olocked(struct binder_ref *ref)
 		binder_dequeue_work(ref->proc, &ref->death->work);
 		binder_stats_deleted(BINDER_STAT_DEATH);
 	}
+
+	if (ref->freeze)
+		binder_dequeue_work(ref->proc, &ref->freeze->work);
+
 	binder_stats_deleted(BINDER_STAT_REF);
 }
 
@@ -1810,9 +1819,9 @@ static size_t binder_get_object(struct binder_proc *proc,
 
 	read_size = min_t(size_t, sizeof(*object), buffer->data_size - offset);
 	if (offset > buffer->data_size || read_size < sizeof(*hdr) ||
-	    !IS_ALIGNED(offset, sizeof(u32)))
+		!IS_ALIGNED(offset, sizeof(u32)))
 		return 0;
-
+		
 	if (u) {
 		if (copy_from_user(object, u + offset, read_size))
 			return 0;
@@ -2740,6 +2749,46 @@ static int binder_translate_fd_array(struct list_head *pf_head,
 	return 0;
 }
 
+// [ @SystemFW
+static void print_binder_proc_inner(struct binder_proc *proc) 
+{
+	struct rb_node *pn;
+	struct binder_thread *p_thread;
+	struct binder_transaction *t;
+	struct binder_buffer *buffer;
+	uint32_t cnt = 1; 
+
+	binder_inner_proc_lock(proc);
+	for (pn = rb_first(&proc->threads); pn != NULL; pn = rb_next(pn)) {
+		p_thread = rb_entry(pn, struct binder_thread, rb_node);
+		t = p_thread->transaction_stack;
+		if (t) {
+			spin_lock(&t->lock);  
+			if (t->from != p_thread && t->to_thread == p_thread) { //incoming transaction
+				buffer = t->buffer;
+				if (buffer != NULL) {
+					pr_info("[%d] from %d:%d to %d:%d size %zd:%zd\n",
+							cnt, t->from ? t->from->proc->pid : 0,
+							t->from ? t->from->pid : 0,
+							t->to_proc ? t->to_proc->pid : 0,
+							t->to_thread ? t->to_thread->pid : 0,
+							buffer->data_size, buffer->offsets_size);
+				} else {
+					pr_info("[%d] from %d:%d to %d:%d\n",
+							cnt, t->from ? t->from->proc->pid : 0,
+							t->from ? t->from->pid : 0,
+							t->to_proc ? t->to_proc->pid : 0,
+							t->to_thread ? t->to_thread->pid : 0);
+				}
+				cnt++;
+			}
+			spin_unlock(&t->lock);
+		}
+	}
+	binder_inner_proc_unlock(proc);
+}
+// ] @SystemFW
+
 static int binder_fixup_parent(struct list_head *pf_head,
 			       struct binder_transaction *t,
 			       struct binder_thread *thread,
@@ -3345,6 +3394,13 @@ static void binder_transaction(struct binder_proc *proc,
 			BR_DEAD_REPLY : BR_FAILED_REPLY;
 		return_error_line = __LINE__;
 		t->buffer = NULL;
+		// [ @SystemFW
+		if (return_error_param == -ENOSPC) {
+			mutex_lock(&binder_procs_lock);
+			print_binder_proc_inner(target_proc);
+			mutex_unlock(&binder_procs_lock);
+		}
+		// ] @SystemFW
 		goto err_binder_alloc_buf_failed;
 	}
 	if (secctx) {
@@ -3832,7 +3888,6 @@ binder_request_freeze_notification(struct binder_proc *proc,
 {
 	struct binder_ref_freeze *freeze;
 	struct binder_ref *ref;
-	bool is_frozen;
 
 	freeze = kzalloc(sizeof(*freeze), GFP_KERNEL);
 	if (!freeze)
@@ -3848,31 +3903,30 @@ binder_request_freeze_notification(struct binder_proc *proc,
 	}
 
 	binder_node_lock(ref->node);
-
-	if (ref->freeze || !ref->node->proc) {
-		binder_user_error("%d:%d invalid BC_REQUEST_FREEZE_NOTIFICATION %s\n",
-				  proc->pid, thread->pid,
-				  ref->freeze ? "already set" : "dead node");
+	if (ref->freeze) {
+		binder_user_error("%d:%d BC_REQUEST_FREEZE_NOTIFICATION already set\n",
+				  proc->pid, thread->pid);
 		binder_node_unlock(ref->node);
 		binder_proc_unlock(proc);
 		kfree(freeze);
 		return -EINVAL;
 	}
-	binder_inner_proc_lock(ref->node->proc);
-	is_frozen = ref->node->proc->is_frozen;
-	binder_inner_proc_unlock(ref->node->proc);
 
 	INIT_LIST_HEAD(&freeze->work.entry);
 	freeze->cookie = handle_cookie->cookie;
 	freeze->work.type = BINDER_WORK_FROZEN_BINDER;
-	freeze->is_frozen = is_frozen;
-
 	ref->freeze = freeze;
 
-	binder_inner_proc_lock(proc);
-	binder_enqueue_work_ilocked(&ref->freeze->work, &proc->todo);
-	binder_wakeup_proc_ilocked(proc);
-	binder_inner_proc_unlock(proc);
+	if (ref->node->proc) {
+		binder_inner_proc_lock(ref->node->proc);
+		freeze->is_frozen = ref->node->proc->is_frozen;
+		binder_inner_proc_unlock(ref->node->proc);
+
+		binder_inner_proc_lock(proc);
+		binder_enqueue_work_ilocked(&freeze->work, &proc->todo);
+		binder_wakeup_proc_ilocked(proc);
+		binder_inner_proc_unlock(proc);
+	}
 
 	binder_node_unlock(ref->node);
 	binder_proc_unlock(proc);
@@ -5145,6 +5199,15 @@ static void binder_release_work(struct binder_proc *proc,
 		} break;
 		case BINDER_WORK_NODE:
 			break;
+		case BINDER_WORK_CLEAR_FREEZE_NOTIFICATION: {
+			struct binder_ref_freeze *freeze;
+
+			freeze = container_of(w, struct binder_ref_freeze, work);
+			binder_debug(BINDER_DEBUG_DEAD_TRANSACTION,
+				     "undelivered freeze notification, %016llx\n",
+				     (u64)freeze->cookie);
+			kfree(freeze);
+		} break;
 		default:
 			pr_err("unexpected work type, %d, not freed\n",
 			       wtype);
@@ -5558,6 +5621,7 @@ static bool binder_txns_pending_ilocked(struct binder_proc *proc)
 
 static void binder_add_freeze_work(struct binder_proc *proc, bool is_frozen)
 {
+	struct binder_node *prev = NULL;
 	struct rb_node *n;
 	struct binder_ref *ref;
 
@@ -5566,7 +5630,10 @@ static void binder_add_freeze_work(struct binder_proc *proc, bool is_frozen)
 		struct binder_node *node;
 
 		node = rb_entry(n, struct binder_node, rb_node);
+		binder_inc_node_tmpref_ilocked(node);
 		binder_inner_proc_unlock(proc);
+		if (prev)
+			binder_put_node(prev);
 		binder_node_lock(node);
 		hlist_for_each_entry(ref, &node->refs, node_entry) {
 			/*
@@ -5592,10 +5659,15 @@ static void binder_add_freeze_work(struct binder_proc *proc, bool is_frozen)
 			}
 			binder_inner_proc_unlock(ref->proc);
 		}
+		prev = node;
 		binder_node_unlock(node);
 		binder_inner_proc_lock(proc);
+		if (proc->is_dead)
+			break;
 	}
 	binder_inner_proc_unlock(proc);
+	if (prev)
+		binder_put_node(prev);
 }
 
 static int binder_ioctl_freeze(struct binder_freeze_info *info,
@@ -5887,6 +5959,15 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		binder_inner_proc_unlock(proc);
 		break;
 	}
+	// [ @SystemFW
+	case BINDER_SET_SYSTEM_SERVER_PID: {
+		if (copy_from_user(&system_server_pid, ubuf, sizeof(system_server_pid))) {
+			ret = -EINVAL;
+			goto err;
+		}
+		break;
+	}
+	// ] @SystemFW
 	default:
 		ret = -EINVAL;
 		goto err;
@@ -6258,6 +6339,7 @@ static void binder_deferred_release(struct binder_proc *proc)
 
 	binder_release_work(proc, &proc->todo);
 	binder_release_work(proc, &proc->delivered_death);
+	binder_release_work(proc, &proc_wrapper(proc)->delivered_freeze);
 
 	binder_debug(BINDER_DEBUG_OPEN_CLOSE,
 		     "%s: %d threads %d, nodes %d (ref %d), refs %d, active transactions %d\n",
@@ -6390,6 +6472,12 @@ static void print_binder_work_ilocked(struct seq_file *m,
 		break;
 	case BINDER_WORK_CLEAR_DEATH_NOTIFICATION:
 		seq_printf(m, "%shas cleared death notification\n", prefix);
+		break;
+	case BINDER_WORK_FROZEN_BINDER:
+		seq_printf(m, "%shas frozen binder\n", prefix);
+		break;
+	case BINDER_WORK_CLEAR_FREEZE_NOTIFICATION:
+		seq_printf(m, "%shas cleared freeze notification\n", prefix);
 		break;
 	default:
 		seq_printf(m, "%sunknown work: type %d\n", prefix, w->type);
@@ -6538,6 +6626,10 @@ static void print_binder_proc(struct seq_file *m,
 					  "  pending transaction", w);
 	list_for_each_entry(w, &proc->delivered_death, entry) {
 		seq_puts(m, "  has delivered dead binder\n");
+		break;
+	}
+	list_for_each_entry(w, &proc_wrapper(proc)->delivered_freeze, entry) {
+		seq_puts(m, "  has delivered freeze binder\n");
 		break;
 	}
 	binder_inner_proc_unlock(proc);

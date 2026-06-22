@@ -288,6 +288,10 @@ extern struct root_domain def_root_domain;
 extern struct mutex sched_domains_mutex;
 #endif
 
+struct sched_param {
+	int sched_priority;
+};
+
 struct sched_info {
 #ifdef CONFIG_SCHED_INFO
 	/* Cumulative counters: */
@@ -1322,6 +1326,11 @@ struct task_struct {
 
 	/* Used by memcontrol for targeted memcg charge: */
 	struct mem_cgroup		*active_memcg;
+#endif
+
+#ifdef CONFIG_TASK_HAS_ALLOC_FREE_STAT
+	unsigned long long alloc_sum;
+	unsigned long long free_sum;
 #endif
 
 #ifdef CONFIG_BLK_CGROUP
