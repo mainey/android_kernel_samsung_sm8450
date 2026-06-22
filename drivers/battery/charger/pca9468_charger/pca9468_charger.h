@@ -9,9 +9,13 @@
 #ifndef _PCA9468_CHARGER_H_
 #define _PCA9468_CHARGER_H_
 
+#include <linux/minmax.h>
+
 #define BITS(_end, _start) ((BIT(_end) - BIT(_start)) + BIT(_end))
 #define MASK2SHIFT(_mask)	__ffs(_mask)
+#ifndef MIN
 #define MIN(a, b)	   ((a < b) ? (a):(b))
+#endif
 
 //
 // Register Map

@@ -23,6 +23,9 @@
 
 #ifndef	_bcmutils_h_
 #define	_bcmutils_h_
+#ifdef __KERNEL__
+#include <linux/minmax.h>
+#endif
 
 #include <bcmtlv.h>
 

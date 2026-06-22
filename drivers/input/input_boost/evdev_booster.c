@@ -39,12 +39,6 @@ static struct notifier_block ib_event_notifier = {
 	 .priority = 1,
 };
 
-#if defined(CONFIG_SEC_INPUT_BOOSTER_HANDLER)
-struct workqueue_struct *ib_unbound_highwq;
-spinlock_t ib_idx_lock;
-struct ib_event_work *ib_evt_work;
-int ib_work_cnt;
-
 int ib_notifier_register(struct notifier_block *nb) {
 	/* nothing to do here */
 	return 0;
@@ -55,6 +49,11 @@ int ib_notifier_unregister(struct notifier_block *nb) {
 	return 0;
 }
 
+#if defined(CONFIG_SEC_INPUT_BOOSTER_HANDLER)
+struct workqueue_struct *ib_unbound_highwq;
+spinlock_t ib_idx_lock;
+struct ib_event_work *ib_evt_work;
+int ib_work_cnt;
 static void evdev_ib_trigger(struct work_struct* work)
 {
 	struct ib_event_work *ib_work = container_of(work, struct ib_event_work, evdev_work);

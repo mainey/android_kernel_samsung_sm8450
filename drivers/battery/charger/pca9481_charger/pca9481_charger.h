@@ -11,6 +11,8 @@
 #ifndef _PCA9481_CHARGER_H_
 #define _PCA9481_CHARGER_H_
 
+#include <linux/minmax.h>
+
 /* IIN offset as the switching frequency in uA*/
 static int iin_fsw_cfg[16] = { 9990, 10540, 11010, 11520, 12000, 12520, 12990, 13470,
 								5460, 6050, 6580, 7150, 7670, 8230, 8720, 9260 };
@@ -38,8 +40,12 @@ struct pca9481_platform_data {
 
 #define BITS(_end, _start) ((BIT(_end) - BIT(_start)) + BIT(_end))
 #define MASK2SHIFT(_mask)	__ffs(_mask)
+#ifndef MIN
 #define MIN(a, b)	((a < b) ? (a):(b))
+#endif
+#ifndef MAX
 #define MAX(a, b)	((a > b) ? (a):(b))
+#endif
 
 /************************/
 /* PCA9481 Register Map */
